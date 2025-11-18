@@ -1,0 +1,253 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: 'Deploy to production'
+        required: false
+        default: 'false'
+
+env:
+  AWS_REGION: us-east-1
+  PYTHON_VERSION: '3.9'
+
+jobs:
+  test:
+    name: Code Quality & Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Cache pip packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov black flake8 mypy bandit safety
+    
+    - name: Code formatting check
+      run: |
+        black --check src/ tests/
+    
+    - name: Linting
+      run: |
+        flake8 src/ tests/ --max-line-length=100 --ignore=E203,W503
+    
+    - name: Type checking
+      run: |
+        mypy src/ --ignore-missing-imports
+      continue-on-error: true
+    
+    - name: Security check
+      run: |
+        bandit -r src/ -ll
+        safety check --json
+      continue-on-error: true
+    
+    - name: Run unit tests
+      run: |
+        pytest tests/ -v --cov=src --cov-report=xml --cov-report=html
+    
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+
+  build:
+    name: Build & Package
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Package training code
+      run: |
+        cd src/training
+        tar czf training.tar.gz *.py
+        cd ../..
+    
+    - name: Package inference code
+      run: |
+        cd src/inference
+        tar czf inference.tar.gz *.py
+        cd ../..
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: ml-packages
+        path: |
+          src/training/training.tar.gz
+          src/inference/inference.tar.gz
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    environment: staging
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Deploy model to staging
+      run: |
+        python src/inference/deploy.py \
+          --deployment-type serverless \
+          --endpoint-name chest-xray-staging \
+          --memory-size 4096 \
+          --max-concurrency 5
+      env:
+        SAGEMAKER_ROLE: ${{ secrets.SAGEMAKER_ROLE }}
+    
+    - name: Run smoke tests
+      run: |
+        python src/inference/test_endpoint.py \
+          --endpoint-name chest-xray-staging \
+          --region ${{ env.AWS_REGION }}
+    
+    - name: Notify on success
+      if: success()
+      run: |
+        echo "✓ Staging deployment successful!"
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.event.inputs.deploy == 'true' || (github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[deploy-prod]'))
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Deploy model to production
+      run: |
+        python src/inference/deploy.py \
+          --deployment-type serverless \
+          --endpoint-name chest-xray-production \
+          --memory-size 4096 \
+          --max-concurrency 10
+      env:
+        SAGEMAKER_ROLE: ${{ secrets.SAGEMAKER_ROLE }}
+    
+    - name: Run integration tests
+      run: |
+        python src/inference/test_endpoint.py \
+          --endpoint-name chest-xray-production \
+          --load-test \
+          --num-requests 20
+    
+    - name: Create GitHub Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: v${{ github.run_number }}
+        release_name: Release v${{ github.run_number }}
+        body: |
+          Production deployment of chest X-ray classifier
+          - Commit: ${{ github.sha }}
+          - Branch: ${{ github.ref }}
+        draft: false
+        prerelease: false
+    
+    - name: Notify on success
+      if: success()
+      run: |
+        echo "✓ Production deployment successful!"
+
+  monitor:
+    name: Post-Deployment Monitoring
+    runs-on: ubuntu-latest
+    needs: deploy-production
+    if: always()
+    
+    steps:
+    - name: Check endpoint health
+      run: |
+        echo "Monitoring endpoint health..."
+        # Add monitoring checks here
+    
+    - name: Generate deployment report
+      run: |
+        echo "=== Deployment Report ===" > report.txt
+        echo "Date: $(date)" >> report.txt
+        echo "Commit: ${{ github.sha }}" >> report.txt
+        echo "Status: ${{ job.status }}" >> report.txt
+    
+    - name: Upload report
+      uses: actions/upload-artifact@v3
+      with:
+        name: deployment-report
+        path: report.txt
