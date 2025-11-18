@@ -180,24 +180,3 @@ pytest tests/integration/ --aws-profile default
 ## 🤝 Contributing
 
 This is a portfolio project, but suggestions are welcome via issues.
-
-## 📄 License
-
-MIT License - See LICENSE file
-
-## 👤 Author
-
-[Your Name]
-- GitHub: [@yourusername]
-- LinkedIn: [Your Profile]
-- Portfolio: [your-site.com]
-
-## 🙏 Acknowledgments
-
-- NIH Clinical Center for the Chest X-Ray dataset
-- AWS SageMaker documentation and examples
-- Healthcare ML community
-
----
-
-**Note**: This project is for educational/portfolio purposes. Not intended for clinical use.
